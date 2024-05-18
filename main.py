@@ -1,16 +1,29 @@
 """This module contains the business logic of the function.
 
-Use the automation_context module to wrap your function in an Autamate context helper
+Use the automation_context module to wrap your function in an Automate context helper
 """
+import os
+import tempfile
+from typing import Union, List
 
-from pydantic import Field, SecretStr
+from specklepy.objects.geometry import Mesh as SpeckleMesh
+
 from speckle_automate import (
     AutomateBase,
     AutomationContext,
     execute_automate_function,
 )
 
-from flatten import flatten_base
+import trimesh
+
+from Utilities.helpers import (
+    speckle_mesh_to_trimesh,
+    combine_transform_matrices,
+    extract_base_and_transform,
+    create_mesh_with_normals,
+)
+
+from pydantic import Field
 
 
 class FunctionInputs(AutomateBase):
@@ -21,14 +34,15 @@ class FunctionInputs(AutomateBase):
     https://docs.pydantic.dev/latest/usage/models/
     """
 
-    # an example how to use secret values
-    whisper_message: SecretStr = Field(title="This is a secret message")
-    forbidden_speckle_type: str = Field(
-        title="Forbidden speckle type",
-        description=(
-            "If a object has the following speckle_type,"
-            " it will be marked with an error."
-        ),
+    export_binary: bool = Field(
+        default=True,
+        title="Export as Binary GLTF (GLB)",
+        description="Export the file as a binary GLTF (GLB) instead of plain GLTF.",
+    )
+    compress_meshes: bool = Field(
+        default=False,
+        title="Compress Meshes",
+        description="Apply mesh compression to reduce file size.",
     )
 
 
@@ -42,54 +56,77 @@ def automate_function(
         automate_context: A context helper object, that carries relevant information
             about the runtime context of this function.
             It gives access to the Speckle project data, that triggered this run.
-            It also has conveniece methods attach result data to the Speckle model.
-        function_inputs: An instance object matching the defined schema.
+            It also has convenience methods attach result data to the Speckle model.
+        function_inputs: The input values for this function, as defined in the
+            FunctionInputs class.
     """
-    # the context provides a conveniet way, to receive the triggering version
+    # Retrieve the version of the Speckle model that triggered this run.
     version_root_object = automate_context.receive_version()
 
-    objects_with_forbidden_speckle_type = [
-        b
-        for b in flatten_base(version_root_object)
-        if b.speckle_type == function_inputs.forbidden_speckle_type
-    ]
-    count = len(objects_with_forbidden_speckle_type)
+    # Determine the path where the GLTF file conversion was triggered from, we will use this as the artifact name.
+    source_model_path = automate_context.automation_run_data.branch_name
 
-    if count > 0:
-        # this is how a run is marked with a failure cause
-        automate_context.attach_error_to_objects(
-            category="Forbidden speckle_type"
-            " ({function_inputs.forbidden_speckle_type})",
-            object_ids=[o.id for o in objects_with_forbidden_speckle_type if o.id],
-            message="This project should not contain the type: "
-            f"{function_inputs.forbidden_speckle_type}",
+    # Ensure the version data exists.
+    if not version_root_object:
+        raise Exception("The model version does not exist.")
+
+    # List to store all trimesh objects for the GLTF export.
+    mesh_objects = []
+
+    # Extract and transform base objects
+    for base, current_id, transform_list in extract_base_and_transform(
+        version_root_object
+    ):
+        if isinstance(base, SpeckleMesh):
+            # Convert Speckle mesh to trimesh format.
+            base_mesh = speckle_mesh_to_trimesh(base)
+            base_mesh = create_mesh_with_normals(base_mesh)
+
+            # Apply transformation if any exist.
+            if transform_list:
+                transform_matrix = combine_transform_matrices(transform_list)
+                base_mesh.apply_transform(transform_matrix)
+            mesh_objects.append(base_mesh)
+        elif hasattr(base, "displayValue"):
+            display_values: Union[List[SpeckleMesh], SpeckleMesh] = base.displayValue
+
+            if not isinstance(display_values, list):
+                display_values = [display_values]
+
+            for display_value in display_values:
+                if isinstance(display_value, SpeckleMesh):
+                    base_mesh = speckle_mesh_to_trimesh(display_value)
+                    base_mesh = create_mesh_with_normals(base_mesh)
+
+                    if transform_list:
+                        transform_matrix = combine_transform_matrices(transform_list)
+                        base_mesh.apply_transform(transform_matrix)
+                    mesh_objects.append(base_mesh)
+
+    # Create a scene from all the collected mesh objects.
+    scene = trimesh.Scene(mesh_objects)
+
+    # Export the scene to a GLTF file with the specified options.
+    export_options = {
+        "compress": function_inputs.compress_meshes,  # Apply compression if specified
+    }
+
+    # Create a temporary directory to store the output GLTF file.
+    with tempfile.TemporaryDirectory() as tmp_dirname:
+        # Determine the output file extension based on user input.
+        output_extension = ".glb" if function_inputs.export_binary else ".gltf"
+        output_path = os.path.join(
+            tmp_dirname, f"{source_model_path}{output_extension}"
         )
-        automate_context.mark_run_failed(
-            "Automation failed: "
-            f"Found {count} object that have one of the forbidden speckle types: "
-            f"{function_inputs.forbidden_speckle_type}"
-        )
 
-        # set the automation context view, to the original model / version view
-        # to show the offending objects
-        automate_context.set_context_view()
+        # Export the scene to a GLTF file at the specified output path.
+        scene.export(output_path, **export_options)
 
-    else:
-        automate_context.mark_run_success("No forbidden types found.")
+        # Attach the exported GLTF file to the Speckle model.
+        automate_context.store_file_result(output_path)
 
-    # if the function generates file results, this is how it can be
-    # attached to the Speckle project / model
-    # automate_context.store_file_result("./report.pdf")
-
-
-def automate_function_without_inputs(automate_context: AutomationContext) -> None:
-    """A function example without inputs.
-
-    If your function does not need any input variables,
-     besides what the automation context provides,
-     the inputs argument can be omitted.
-    """
-    pass
+        # Mark the automation run as successful with a success message.
+        automate_context.mark_run_success("GLTF file exported successfully.")
 
 
 # make sure to call the function with the executor
